@@ -1,0 +1,492 @@
+#!/usr/bin/perl
+
+=pod
+
+=encoding utf8
+
+=head1 NAME
+
+solr_ - Munin wildcard plugin to monitor Apache Solr
+
+=head1 CONFIGURATION
+
+This plugin has the following default settings:
+
+  [solr_core0_*]
+    env.scheme http
+    env.host 127.0.0.1
+    env.port 8983
+    env.path solr
+    env.query_handler /select
+
+You can override the defaults by placing a configuration file in the
+plugin-conf.d directory.
+
+=head1 DESCRIPTION
+
+This plugin uses XML::XPath to extract statistics from the stats.jsp page in
+the Apache Solr web interface.
+
+=cut
+
+use strict;
+use warnings;
+use utf8;
+
+use LWP::Simple;
+use Pod::Usage;
+use URI::URL;
+use XML::XPath;
+
+# configure the script for this run
+my $action = shift @ARGV || 'fetch';
+my ($base, $id, $stat) = split /_/, $0, 3;
+
+if ($action eq 'debug') {
+  $stat = shift @ARGV;
+  $id = 'debug';
+}
+
+# override default settings with the ones from the configuration file
+my $solr_scheme = $ENV{scheme} || 'http';
+my $solr_host = $ENV{host} || '127.0.0.1';
+my $solr_port = $ENV{port} || 8983;
+my $solr_path = $ENV{path} || 'solr';
+my $solr_query_handler = $ENV{query_handler} || '/select';
+
+# get information on all stats available for monitoring
+my %stats = get_stats($solr_query_handler);
+
+SWITCH: {
+  $action eq 'config'   && do { config(); last SWITCH; };
+  $action eq 'fetch'    && do { fetch(); last SWITCH; };
+  $action eq 'autoconf' && do { autoconf(); last SWITCH; };
+  $action eq 'suggest'  && do { suggest(); last SWITCH; };
+  $action eq 'debug'    && do { fetch(); last SWITCH; };
+  pod2usage(2);
+}
+
+# outputs the munin configuration for the current stat
+sub config {
+  # create a unique field name
+  my $field_name = 'solr_' . $id . '_' . $stat;
+
+  # output the main graph configuration
+  print "graph_category solr\n";
+  print 'graph_title ' . $stats{$stat}{'title'} . "\n";
+  # print 'graph_info ' . 'GRAPH INFO' . "\n";
+  print 'graph_vlabel ' . $stats{$stat}{'vlabel'} . "\n";
+  print $field_name . '.label ' . $stats{$stat}{'field'} . "\n";
+  print $field_name . '.info ' . 'DATA POINT INFO' . "\n";
+  print $field_name . '.type ' . $stats{$stat}{'type'} . "\n";
+
+  # set a minimum value is recommended when using derive
+  if ($stats{$stat}{
+'type'} eq 'DERIVE') {
+    print $field_name . ".min 0\n";
+  }
+
+  # all hit ratios are between 0 and 1
+  if ($stat =~ /hit_ratio$/) {
+    print $field_name . ".min 0\n";
+    print $field_name . ".max 1\n";
+  }
+
+  # change the graph scaling since we're dealing with bytes
+  if ($stat eq 'index_size') {
+    print "graph_args --base 1024 --lower-limit 0\n"
+  }
+}
+
+# output the value of a stat to be picked up by munin
+sub fetch {
+  $solr_path .= '/admin/stats.jsp';
+
+  # create the url for the solr stats page
+  my $url = new URI::URL;
+  $url->scheme($solr_scheme);
+  $url->host($solr_host);
+  $url->port($solr_port);
+  $url->path($solr_path);
+
+  # fetch the stats page
+  my $stats_xml = get($url);
+
+  # create a new xpath parser
+  my $xp = XML::XPath->new(xml => $stats_xml);
+
+  # use the settings for the requested stat to create an xpath query...
+  my $xpath = <<XPATH;
+    /solr/solr-info/$stats{$stat}{'section'}
+    /entry[name[contains(., '$stats{$stat}{'name'}')]]
+    /stats/stat[\@name='$stats{$stat}{'field'}']
+XPATH
+
+  # ...and then execute the query
+  my $value = $xp->getNodeText($xpath);
+
+  # remove leading and trailing white space
+  $value =~ s/^\s+|\s+$//g;
+
+  # use the raw number of bytes instead of the number provided by solr
+  if ($stat eq 'index_size') {
+    $value = convert_to_bytes($value);
+  }
+
+  print 'solr_' . $id . '_' . $stat . '.value ' . $value . "\n";
+}
+
+# enable autoconf if required modules are present
+sub autoconf {
+  local $" = ', ';
+
+  my @error = ();
+  foreach my $module (qw/LWP::Simple Pod::Usage URI::URL XML::Xpath/) {
+    if (! eval "require $module;") {
+      push @error, "$module not found";
+    }
+  }
+
+  if (@error) {
+    print "no (@error)\n";
+  }
+  else {
+    print "yes\n";
+  }
+}
+
+# list the names of all wildcard options
+sub suggest {
+  foreach my $key (sort keys %stats) {
+    print $key . "\n";
+  }
+}
+
+# convert the textual values provided by solr to approximate byte counts
+sub convert_to_bytes {
+  my ($value, $unit) = split / /, shift;
+
+  SWITCH: {
+    $unit eq 'KB' && do { return $value << 10; last SWITCH; };
+    $unit eq 'MB' && do { return $value << 20; last SWITCH; };
+    $unit eq 'GB' && do { return $value << 30; last SWITCH; };
+    die "Unknown unit $unit provided by Solr"
+  }
+
+  return $value;
+}
+
+# return information about all available statistics
+sub get_stats {
+  my $query_handler = shift;
+
+  return (
+    # CORE
+
+    'num_docs' => {
+      'type'    => 'GAUGE',
+      'section' => 'CORE',
+      'name'    => 'searcher',
+      'field'   => 'numDocs',
+      'title'   => 'Number of documents in the index',
+      'vlabel'  => 'documents',
+    },
+
+    # QUERYHANDLER
+
+    'avg_time_per_request' => {
+      'type'    => 'GAUGE',
+      'section' => 'QUERYHANDLER',
+      'name'    => $query_handler,
+      'field'   => 'avgTimePerRequest',
+      'title'   => 'Average time per request',
+      'vlabel'  => 'ms',
+    },
+    'avg_requests_per_second' => {
+      'type'    => 'GAUGE',
+      'section' => 'QUERYHANDLER',
+      'name'    => $query_handler,
+      'field'   => 'avgRequestsPerSecond',
+      'title'   => 'Average requests per second',
+      'vlabel'  => 'requests per second',
+    },
+    'avg_requests_per_second_derived' => {
+      'type'    => 'DERIVE',
+      'section' => 'QUERYHANDLER',
+      'name'    => $query_handler,
+      'field'   => 'requests',
+      'title'   => 'Average requests per second',
+      'vlabel'  => 'requests per ${graph_period}',
+    },
+    'errors' => {
+      'type'    => 'DERIVE',
+      'section' => 'QUERYHANDLER',
+      'name'    => $query_handler,
+      'field'   => 'errors',
+      'title'   => 'Errors',
+      'vlabel'  => 'errors per ${graph_period}',
+    },
+    'timeouts' => {
+      'type'    => 'DERIVE',
+      'section' => 'QUERYHANDLER',
+      'name'    => $query_handler,
+      'field'   => 'timeouts',
+      'title'   => 'Timeouts',
+      'vlabel'  => 'timeouts per ${graph_period}',
+    },
+    'index_size' => {
+      'type'    => 'GAUGE',
+      'section' => 'QUERYHANDLER',
+      'name'    => '/replication',
+      'field'   => 'indexSize',
+      'title'   => 'Index size',
+      'vlabel'  => 'bytes',
+    },
+
+    # CACHE
+
+    'query_result_cache_size' => {
+      'type'    => 'GAUGE',
+      'section' => 'CACHE',
+      'name'    => 'queryResultCache',
+      'field'   => 'size',
+      'title'   => 'Query result cache size',
+      'vlabel'  => 'documents',
+    },
+    'query_result_cache_hit_ratio' => {
+      'type'    => 'GAUGE',
+      'section' => 'CACHE',
+      'name'    => 'queryResultCache',
+      'field'   => 'hitratio',
+      'title'   => 'Query result cache hit ratio',
+      'vlabel'  => 'hit ratio',
+    },
+    'query_result_cache_lookups' => {
+      'type'    => 'GAUGE',
+      'section' => 'CACHE',
+      'name'    => 'queryResultCache',
+      'field'   => 'lookups',
+      'title'   => 'Query result cache lookups',
+      'vlabel'  => 'lookups per ${graph_period}',
+    },
+    'query_result_cache_warmup_time' => {
+      'type'    => 'GAUGE',
+      'section' => 'CACHE',
+      'name'    => 'queryResultCache',
+      'field'   => 'warmupTime',
+      'title'   => 'Query result cache warmup time',
+      'vlabel'  => 'ms',
+    },
+    'query_result_cache_lookups_derived' => {
+      'type'    => 'DERIVE',
+      'section' => 'CACHE',
+      'name'    => 'queryResultCache',
+      'field'   => 'cumulative_lookups',
+      'title'   => 'Query result cache lookups',
+      'vlabel'  => 'lookups per ${graph_period}',
+    },
+    'query_result_cache_hits_derived' => {
+      'type'    => 'DERIVE',
+      'section' => 'CACHE',
+      'name'    => 'queryResultCache',
+      'field'   => 'cumulative_hits',
+      'title'   => 'Query result cache hits',
+      'vlabel'  => 'hits per ${graph_period}',
+    },
+    'query_result_cache_inserts_derived' => {
+      'type'    => 'DERIVE',
+      'section' => 'CACHE',
+      'name'    => 'queryResultCache',
+      'field'   => 'cumulative_inserts',
+      'title'   => 'Query result cache inserts',
+      'vlabel'  => 'inserts per ${graph_period}',
+    },
+    'query_result_cache_evictions_derived' => {
+      'type'    => 'DERIVE',
+      'section' => 'CACHE',
+      'name'    => 'queryResultCache',
+      'field'   => 'cumulative_evictions',
+      'title'   => 'Query result cache evictions',
+      'vlabel'  => 'evictions per ${graph_period}',
+    },
+
+    'document_cache_size' => {
+      'type' => 'GAUGE',
+      'section' => 'CACHE',
+      'name' => 'documentCache',
+      'field' => 'size',
+      'title' => 'Document cache size',
+      'vlabel' => 'documents',
+    },
+    'document_cache_hit_ratio' => {
+      'type' => 'GAUGE',
+      'section' => 'CACHE',
+      'name' => 'documentCache',
+      'field' => 'hitratio',
+      'title' => 'Document cache hit ratio',
+      'vlabel' => 'hit ratio',
+    },
+    'document_cache_lookups' => {
+      'type' => 'DERIVE',
+      'section' => 'CACHE',
+      'name' => 'documentCache',
+      'field' => 'lookups',
+      'title' => 'Document cache lookups',
+      'vlabel' => 'lookups per ${graph_period}',
+    },
+    'document_cache_warmup_time' => {
+      'type' => 'GAUGE',
+      'section' => 'CACHE',
+      'name' => 'documentCache',
+      'field' => 'warmupTime',
+      'title' => 'Document cache warmup time',
+      'vlabel' => 'ms',
+    },
+    'document_cache_lookups_derived' => {
+      'type' => 'DERIVE',
+      'section' => 'CACHE',
+      'name' => 'documentCache',
+      'field' => 'cumulative_lookups',
+      'title' => 'Document cache lookups',
+      'vlabel' => 'lookups per ${graph_period}',
+    },
+    'document_cache_hits_derived' => {
+      'type' => 'DERIVE',
+      'section' => 'CACHE',
+      'name' => 'documentCache',
+      'field' => 'cumulative_hits',
+      'title' => 'Document cache hits',
+      'vlabel' => 'hits per ${graph_period}',
+    },
+    'document_cache_inserts_derived' => {
+      'type' => 'DERIVE',
+      'section' => 'CACHE',
+      'name' => 'documentCache',
+      'field' => 'cumulative_inserts',
+      'title' => 'Document cache inserts',
+      'vlabel' => 'inserts per ${graph_period}',
+    },
+    'document_cache_evictions_derived' => {
+      'type' => 'DERIVE',
+      'section' => 'CACHE',
+      'name' => 'documentCache',
+      'field' => 'cumulative_evictions',
+      'title' => 'Document cache evictions',
+      'vlabel' => 'evictions per ${graph_period}',
+    },
+
+    'field_value_cache_size' => {
+      'type' => 'GAUGE',
+      'section' => 'CACHE',
+      'name' => 'fieldValueCache',
+      'field' => 'size',
+      'title' => 'Field value cache size',
+      'vlabel' => 'documents',
+    },
+    'field_value_cache_hit_ratio' => {
+      'type' => 'GAUGE',
+      'section' => 'CACHE',
+      'name' => 'fieldValueCache',
+      'field' => 'hitratio',
+      'title' => 'Field value cache hit ratio',
+      'vlabel' => 'hit ratio',
+    },
+    'field_value_cache_lookups' => {
+      'type' => 'DERIVE',
+      'section' => 'CACHE',
+      'name' => 'fieldValueCache',
+      'field' => 'lookups',
+      'title' => 'Field value cache lookups',
+      'vlabel' => 'lookups per ${graph_period}',
+    },
+    'field_value_cache_warmup_time' => {
+      'type' => 'GAUGE',
+      'section' => 'CACHE',
+      'name' => 'fieldValueCache',
+      'field' => 'warmupTime',
+      'title' => 'Field value cache warmup time',
+      'vlabel' => 'ms',
+    },
+
+    'filter_cache_size' => {
+      'type' => 'GAUGE',
+      'section' => 'CACHE',
+      'name' => 'filterCache',
+      'field' => 'size',
+      'title' => 'Filter cache size',
+      'vlabel' => 'documents',
+    },
+    'filter_cache_hit_ratio' => {
+      'type' => 'GAUGE',
+      'section' => 'CACHE',
+      'name' => 'filterCache',
+      'field' => 'hitratio',
+      'title' => 'Filter cache hit ratio',
+      'vlabel' => 'hit ratio',
+    },
+    'filter_cache_lookups' => {
+      'type' => 'DERIVE',
+      'section' => 'CACHE',
+      'name' => 'filterCache',
+      'field' => 'lookups',
+      'title' => 'Filter cache lookups',
+      'vlabel' => 'lookups per ${graph_period}',
+    },
+    'filter_cache_warmup_time' => {
+      'type' => 'GAUGE',
+      'section' => 'CACHE',
+      'name' => 'filterCache',
+      'field' => 'warmupTime',
+      'title' => 'Filter cache warmup time',
+      'vlabel' => 'ms',
+    },
+  );
+}
+
+=pod
+
+=head1 ACKNOWLEDGEMENTS
+
+Based on the wfsolr_ plugin by Alexandre Simon.
+
+https://github.com/lexsimon/contrib/blob/master/plugins/solr/wfsolr_
+
+This version converts the code to Perl, uses only XPath to extract statistics,
+and adds support for more Solr stats.
+
+=head1 AUTHOR
+
+Morten Wulff, <wulff@ratatosk.net>
+
+=head1 COPYRIGHT
+
+Copyright (c) 2013, Morten Wulff
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL MICHAEL BOSTOCK BE LIABLE FOR ANY DIRECT,
+INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
+OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE,
+EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+=head1 MAGIC MARKERS
+
+#%# family=contrib
+#%# capabilities=autoconf suggest
+
+=cut
