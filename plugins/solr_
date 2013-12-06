@@ -81,8 +81,7 @@ sub config {
   print $field_name . '.type ' . $stats{$stat}{'type'} . "\n";
 
   # set a minimum value is recommended when using derive
-  if ($stats{$stat}{
-'type'} eq 'DERIVE') {
+  if ($stats{$stat}{'type'} eq 'DERIVE') {
     print $field_name . ".min 0\n";
   }
 
