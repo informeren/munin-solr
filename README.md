@@ -2,7 +2,7 @@ Munin Solr plugin
 =================
 
 Munin wildcard plugin to monitor Apache Solr cores. This plugin uses XML::XPath
-to extract statistics from the stats.jsp page in the Apache Solr web interface.
+to extract statistics from the `stats.jsp` page in the Apache Solr web interface.
 
 The current version of the plugin has been tested with Solr 3.6.x.
 
